@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 	"uuid"
@@ -14,46 +15,45 @@ import (
 type Terminal struct {
 	Id string
 
-	Shell *exec.Cmd
+	shell *exec.Cmd
 
-	Stdin  io.WriteCloser
-	Stdout io.ReadCloser
-	Stderr io.ReadCloser
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+	stderr io.ReadCloser
 
-	Queue chan *Job
+	queue chan *Job
 
-	Jobs       map[string]*Job
-	CurrentJob *Job
+	jobs       map[string]*Job
+	currentJob *Job
 
-	Mutex sync.Mutex
-	Wg    sync.WaitGroup
+	mutex sync.Mutex
+	wg    sync.WaitGroup
 
-	Ctx    context.Context
-	Cancel context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type Job struct {
-	Id        string
-	EndMarker string
+	id        string
+	endMarker string
 
-	Command string
-	Status  string
+	command  string
+	status   string
+	exitCode int
 
-	Output string
+	output string
 
-	StartTime  time.Time
-	LastStdout time.Time
-
-	Reuslt int
+	startTime  time.Time
+	lastStdout time.Time
 
 	Done chan struct{}
 }
 
 type JobResult struct {
-	Id string
-
-	Status string
-	Output *string
+	Id       string
+	Status   string
+	ExitCode int
+	Output   *string
 }
 
 type TerminalManager struct {
@@ -65,7 +65,7 @@ const EndMarkerFormat = "END MARKER %s"
 
 var st_term = &TerminalManager{Terminals: make(map[string]*Terminal)}
 
-func (j *Job) isDone() bool {
+func (j *Job) IsDone() bool {
 	select {
 	case <-j.Done:
 		return true
@@ -74,14 +74,49 @@ func (j *Job) isDone() bool {
 	}
 }
 
-func CreateSession(container string) (string, error) {
+func (t *Terminal) WaitForDone(ctx context.Context, timeout time.Duration, job_id string) (string, error) {
+	j := t.jobs[job_id]
+	if j == nil {
+		return "", fmt.Errorf("Invalid job id")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var status string
+	var err error
+	select {
+	case <-j.Done:
+		t.mutex.Lock()
+		status = j.status
+		err = nil
+	case <-ctx.Done():
+		t.mutex.Lock()
+		status = j.status
+		err = ctx.Err()
+	}
+	t.mutex.Unlock()
+	return status, err
+}
+
+func CreateSession(session_id string, container string) (string, error) {
 	var new_term Terminal
 
 	if len(st_term.Terminals) >= 10 {
 		return "", fmt.Errorf("Too many sessions open")
 	}
 
-	new_term.Shell = exec.Command(
+	if session_id == "" {
+		new_term.Id = uuid.New().String()
+	} else {
+		new_term.Id = session_id
+	}
+
+	if st_term.Terminals[new_term.Id] != nil {
+		return "", fmt.Errorf("The specified Session-ID already exists.")
+	}
+
+	new_term.shell = exec.Command(
 		"podman",
 		"exec",
 		"-i",
@@ -91,29 +126,29 @@ func CreateSession(container string) (string, error) {
 		"--noprofile",
 	)
 
-	stdin, err := new_term.Shell.StdinPipe()
+	stdin, err := new_term.shell.StdinPipe()
 	if err != nil {
 		return "", err
 	}
 
-	stdout, err := new_term.Shell.StdoutPipe()
+	stdout, err := new_term.shell.StdoutPipe()
 	if err != nil {
 		return "", err
 	}
 
-	stderr, err := new_term.Shell.StderrPipe()
+	stderr, err := new_term.shell.StderrPipe()
 	if err != nil {
 		return "", err
 	}
 
-	new_term.Stdin = stdin
-	new_term.Stdout = stdout
-	new_term.Stderr = stderr
-	new_term.Queue = make(chan *Job, 30)
-	new_term.Jobs = make(map[string]*Job, 30)
-	new_term.Ctx, new_term.Cancel = context.WithCancel(context.Background())
+	new_term.stdin = stdin
+	new_term.stdout = stdout
+	new_term.stderr = stderr
+	new_term.queue = make(chan *Job, 30)
+	new_term.jobs = make(map[string]*Job, 30)
+	new_term.ctx, new_term.cancel = context.WithCancel(context.Background())
 
-	if err := new_term.Shell.Start(); err != nil {
+	if err := new_term.shell.Start(); err != nil {
 		return "", err
 	}
 
@@ -124,88 +159,93 @@ func CreateSession(container string) (string, error) {
 	st_term.Mutex.Lock()
 	defer st_term.Mutex.Unlock()
 
-	new_term.Id = uuid.New().String()
 	st_term.Terminals[new_term.Id] = &new_term
 
 	return new_term.Id, nil
 }
 
 func (t *Terminal) commandWorker() {
-	t.Wg.Add(1)
-	defer t.Wg.Done()
+	t.wg.Add(1)
+	defer t.wg.Done()
 
 worker:
 	for {
 		select {
-		case <-t.Ctx.Done():
+		case <-t.ctx.Done():
 			break worker
-		case job := <-t.Queue:
-			t.Mutex.Lock()
-			cj := t.CurrentJob
-			t.Mutex.Unlock()
+		case job := <-t.queue:
+			t.mutex.Lock()
+			cj := t.currentJob
+			t.mutex.Unlock()
 
 			if cj != nil {
 				select {
 				case <-cj.Done:
-				case <-t.Ctx.Done():
+				case <-t.ctx.Done():
 					break worker
 				}
 			}
 
-			t.Mutex.Lock()
+			t.mutex.Lock()
 
-			if t.Ctx.Err() != nil || t.Shell.ProcessState != nil {
+			if t.ctx.Err() != nil || t.shell.ProcessState != nil {
 				fmt.Println("Shell is not running?")
 				break worker
 			}
 
-			t.CurrentJob = job
+			t.currentJob = job
 
-			command := "( " + job.Command + " ) </dev/null\n"
-			_, err := io.WriteString(t.Stdin, command)
+			command := "( " + job.command + " ) </dev/null\n"
+			_, err := io.WriteString(t.stdin, command)
 			if err != nil {
-				fmt.Println("Failed to execute command: ", job.Command)
-				job.Status = "error"
+				fmt.Println("Failed to execute command: ", job.command)
+				job.status = "error"
 				close(job.Done)
 			} else {
-				job.Status = "running"
+				job.status = "running"
 			}
 
-			t.Mutex.Unlock()
+			t.mutex.Unlock()
 		}
 	}
 }
 
 func (t *Terminal) readOutput(fd io.Reader) {
-	t.Wg.Add(1)
-	defer t.Wg.Done()
+	t.wg.Add(1)
+	defer t.wg.Done()
 
 	scanner := bufio.NewScanner(fd)
 
 	for scanner.Scan() {
 		buf := scanner.Text()
 
-		t.Mutex.Lock()
-		if t.CurrentJob != nil && !t.CurrentJob.isDone() {
-			if buf == t.CurrentJob.EndMarker {
-				t.CurrentJob.Status = "done"
-				close(t.CurrentJob.Done)
+		t.mutex.Lock()
+		if t.currentJob != nil && !t.currentJob.IsDone() {
+			if strings.HasPrefix(buf, t.currentJob.endMarker) {
+				var exit_code int
+				_, err := fmt.Sscanf(buf, t.currentJob.endMarker+" %d", &exit_code)
+				if err != nil {
+					fmt.Println("Failed to parse end-marker?")
+				}
+				t.currentJob.exitCode = exit_code
+				t.currentJob.status = "done"
+				close(t.currentJob.Done)
 			} else {
-				t.CurrentJob.Output += buf + "\n"
+				t.currentJob.output += buf + "\n"
 			}
 		}
-		t.Mutex.Unlock()
+		t.mutex.Unlock()
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Println("read error:", err)
 	}
 
-	t.Mutex.Lock()
-	if t.CurrentJob != nil && !t.CurrentJob.isDone() {
-		close(t.CurrentJob.Done)
+	t.mutex.Lock()
+	if t.currentJob != nil && !t.currentJob.IsDone() {
+		close(t.currentJob.Done)
 	}
-	t.Mutex.Unlock()
+	t.mutex.Unlock()
 }
 
 func GetSession(term_id string) *Terminal {
@@ -219,48 +259,48 @@ func (t *Terminal) Run(term_id string, cmd string) (string, error) {
 		return "", fmt.Errorf("Command empty")
 	}
 
-	new_task.Id = uuid.New().String()
-	new_task.EndMarker = fmt.Sprintf(EndMarkerFormat, new_task.Id)
-	new_task.Command = cmd + "\necho " + new_task.EndMarker
-	new_task.Status = "pending"
-	new_task.Output = ""
-	new_task.StartTime = time.Now()
-	new_task.LastStdout = time.Now()
-	new_task.Reuslt = 0
+	new_task.id = uuid.New().String()
+	new_task.endMarker = fmt.Sprintf(EndMarkerFormat, new_task.id)
+	new_task.command = cmd + "\necho " + new_task.endMarker + " $?"
+	new_task.status = "pending"
+	new_task.output = ""
+	new_task.startTime = time.Now()
+	new_task.lastStdout = time.Now()
 
 	new_task.Done = make(chan struct{})
 
-	t.Mutex.Lock()
-	t.Jobs[new_task.Id] = &new_task
-	t.Mutex.Unlock()
-	t.Queue <- &new_task
+	t.mutex.Lock()
+	t.jobs[new_task.id] = &new_task
+	t.mutex.Unlock()
+	t.queue <- &new_task
 
-	return new_task.Id, nil
+	return new_task.id, nil
 }
 
 func (t *Terminal) _queryStatus(job_id string) (JobResult, error) {
-	if t.Jobs[job_id] == nil {
+	if t.jobs[job_id] == nil {
 		return JobResult{}, fmt.Errorf("Invalid job id")
 	}
 
 	var r = JobResult{
-		Id:     t.Jobs[job_id].Id,
-		Status: t.Jobs[job_id].Status,
-		Output: &t.Jobs[job_id].Output,
+		Id:       t.jobs[job_id].id,
+		Status:   t.jobs[job_id].status,
+		ExitCode: t.jobs[job_id].exitCode,
+		Output:   &t.jobs[job_id].output,
 	}
 
 	return r, nil
 }
 
 func (t *Terminal) QueryStatus(job_id string) (JobResult, error) {
-	t.Mutex.Lock()
-	defer t.Mutex.Unlock()
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
 	return t._queryStatus(job_id)
 }
 
 func (t *Terminal) PopResult(job_id string) (JobResult, error) {
-	t.Mutex.Lock()
-	defer t.Mutex.Unlock()
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
 	r, err := t._queryStatus(job_id)
 
 	if err != nil {
@@ -269,24 +309,24 @@ func (t *Terminal) PopResult(job_id string) (JobResult, error) {
 		return JobResult{}, fmt.Errorf("")
 	}
 
-	if t.Jobs[job_id] == t.CurrentJob {
-		t.CurrentJob = nil
+	if t.jobs[job_id] == t.currentJob {
+		t.currentJob = nil
 	}
 
-	delete(t.Jobs, job_id)
+	delete(t.jobs, job_id)
 
 	return r, nil
 }
 
 func (t *Terminal) CloseSession() error {
-	t.Cancel()
+	t.cancel()
 
 	var err error = nil
 
-	if t.Shell.Process != nil {
-		t.Stdin.Close()
-		err = t.Shell.Wait()
-		t.Wg.Wait()
+	if t.shell.Process != nil {
+		t.stdin.Close()
+		err = t.shell.Wait()
+		t.wg.Wait()
 	}
 
 	st_term.Mutex.Lock()
