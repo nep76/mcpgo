@@ -398,7 +398,7 @@ func web_search(
 	query := url.Values{}
 	query.Set("q", input.Query)
 	query.Set("format", "json")
-	req_url := "http://localhost:18080/search?" + query.Encode()
+	req_url := "http://localhost/searxng/search?" + query.Encode()
 
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
