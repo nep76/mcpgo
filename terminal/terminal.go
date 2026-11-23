@@ -198,7 +198,7 @@ worker:
 			command := "( " + job.command + " ) </dev/null\n"
 			_, err := io.WriteString(t.stdin, command)
 			if err != nil {
-				fmt.Println("Failed to execute command: ", job.command)
+				fmt.Printf("Failed to execute command: %s: %s", job.command, err)
 				job.status = "error"
 				close(job.Done)
 			} else {
@@ -225,7 +225,7 @@ func (t *Terminal) readOutput(fd io.Reader) {
 				var exit_code int
 				_, err := fmt.Sscanf(buf, t.currentJob.endMarker+" %d", &exit_code)
 				if err != nil {
-					fmt.Println("Failed to parse end-marker?")
+					fmt.Println("Failed to parse end-marker?: ", err)
 				}
 				t.currentJob.exitCode = exit_code
 				t.currentJob.status = "done"

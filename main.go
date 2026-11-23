@@ -130,6 +130,8 @@ func container_shell_execute(
 
 	fmt.Println("Session: ", t.Id)
 
+	fmt.Println("Run: ", cmd.Command)
+
 	job_id, err := t.Run(t.Id, cmd.Command)
 	if err != nil {
 		return nil, ContainerShellResult{}, err
