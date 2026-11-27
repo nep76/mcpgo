@@ -19,7 +19,7 @@ import (
 )
 
 const selfName = "nep_mcpgo"
-const selfVersion = "0.0.4"
+const selfVersion = "0.0.5"
 
 type SearchInput struct {
 	Query string `json:"query" jsonschema:"検索キーワード"`
@@ -118,7 +118,7 @@ func container_shell_execute(
 	t := terminal.GetSession(session_id)
 	if t == nil {
 		fmt.Println("Create Session")
-		_, err := terminal.CreateSession(session_id, "qwen-test")
+		_, err := terminal.CreateSession(session_id, "qwen-test", "/mnt")
 		if err != nil {
 			return nil, ContainerShellResult{}, err
 		}
@@ -459,17 +459,15 @@ func main() {
 		Name: "web_search",
 		Description: "インターネット上の情報を検索します。" +
 			"最新情報や、手元の知識だけでは正確に回答できない情報を調べる場合に使用してください。" +
-			"ページの詳しい内容を確認する必要がある場合はweb_fetchを使ってページ本文を取得してください。" +
-			"取得できなかった場合は、その理由を報告してください。",
+			"ページの詳しい内容を確認する必要がある場合はweb_fetchを使ってページ本文を取得してください。",
 	}, web_search)
 
 	mcp.AddTool(mcp_server, &mcp.Tool{
 		Name: "web_fetch",
-		Description: "指定されたURLからファイルやWebページをHTTP GETでダウンロードし、その内容をテキストとして返します。" +
+		Description: "指定されたURLからファイルやWebページをHTTP GETでダウンロードし、HTMLタグを除去したプレーンテキストとして返します。" +
 			"web_searchの検索結果に含まれているURLをダウンロードすることもできます。" +
 			"ユーザーがURLを指定して、そのファイルやページの内容について質問した場合は、必ずこのツールを使用して実際の内容を取得してください。" +
-			"URLやファイル名から内容を推測してはいけません。" +
-			"取得できなかった場合は、その理由を報告してください。",
+			"URLやファイル名から内容を推測してはいけません。",
 	}, web_fetch)
 
 	mcp.AddTool(mcp_server, &mcp.Tool{

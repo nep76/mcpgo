@@ -99,7 +99,7 @@ func (t *Terminal) WaitForDone(ctx context.Context, timeout time.Duration, job_i
 	return status, err
 }
 
-func CreateSession(session_id string, container string) (string, error) {
+func CreateSession(session_id string, container string, cwd string) (string, error) {
 	var new_term Terminal
 
 	if len(st_term.Terminals) >= 10 {
@@ -116,15 +116,13 @@ func CreateSession(session_id string, container string) (string, error) {
 		return "", fmt.Errorf("The specified Session-ID already exists.")
 	}
 
-	new_term.shell = exec.Command(
-		"podman",
-		"exec",
-		"-i",
-		container,
-		"bash",
-		"--norc",
-		"--noprofile",
-	)
+	args := []string{"exec", "-i"}
+	if cwd != "" {
+		args = append(args, "-w", cwd)
+	}
+	args = append(args, container, "bash", "--norc", "--noprofile")
+
+	new_term.shell = exec.Command("podman", args...)
 
 	stdin, err := new_term.shell.StdinPipe()
 	if err != nil {
